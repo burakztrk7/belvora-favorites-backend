@@ -1,4 +1,5 @@
 import type {LoaderFunctionArgs} from "react-router";
+import {useLoaderData} from "react-router";
 import {authenticate} from "../shopify.server";
 
 export async function loader({request}: LoaderFunctionArgs) {
@@ -9,7 +10,6 @@ export async function loader({request}: LoaderFunctionArgs) {
       customers(first: 50) {
         nodes {
           id
-          email
           firstName
           lastName
 
@@ -18,7 +18,7 @@ export async function loader({request}: LoaderFunctionArgs) {
               id
               name
               cancelledAt
-              financialStatus
+              displayFinancialStatus
 
               totalPriceSet {
                 shopMoney {
@@ -35,18 +35,26 @@ export async function loader({request}: LoaderFunctionArgs) {
 
   const json = await response.json();
 
+  if (json.errors?.length) {
+    return {
+      ok: false,
+      errors: json.errors,
+      customers: [],
+    };
+  }
+
   const customers = json.data?.customers?.nodes || [];
 
   const result = customers.map((customer: any) => {
-    const eligibleOrders = (customer.orders?.nodes || []).filter((order: any) => {
-      const paid =
-        order.financialStatus === "PAID" ||
-        order.financialStatus === "PARTIALLY_REFUNDED";
+    const eligibleOrders = (customer.orders?.nodes || []).filter(
+      (order: any) => {
+        const paid =
+          order.displayFinancialStatus === "PAID" ||
+          order.displayFinancialStatus === "PARTIALLY_REFUNDED";
 
-      const notCancelled = !order.cancelledAt;
-
-      return paid && notCancelled;
-    });
+        return paid && !order.cancelledAt;
+      }
+    );
 
     const totalSpent = eligibleOrders.reduce(
       (sum: number, order: any) =>
@@ -55,20 +63,54 @@ export async function loader({request}: LoaderFunctionArgs) {
     );
 
     return {
-      customerId: customer.id,
-      email: customer.email,
-      name: [customer.firstName, customer.lastName]
-        .filter(Boolean)
-        .join(" "),
+      name:
+        [customer.firstName, customer.lastName]
+          .filter(Boolean)
+          .join(" ") || "İsimsiz müşteri",
       eligibleOrders: eligibleOrders.length,
-      totalSpent,
+      totalSpent: Math.round(totalSpent * 100) / 100,
       pointsToGive: Math.floor(totalSpent),
     };
   });
 
-  return Response.json({
+  return {
     ok: true,
     shop: session.shop,
+    customerCount: result.length,
     customers: result,
-  });
+  };
+}
+
+export default function BackfillPreview() {
+  const data = useLoaderData<typeof loader>();
+
+  return (
+    <main
+      style={{
+        fontFamily: "Arial, sans-serif",
+        maxWidth: "900px",
+        margin: "40px auto",
+        padding: "20px",
+      }}
+    >
+      <h1>Belvora Club — Geçmiş Puan Önizlemesi</h1>
+
+      <p>
+        Bu sayfa yalnızca hesaplama yapar. Henüz müşterilere puan
+        yazılmaz.
+      </p>
+
+      <pre
+        style={{
+          background: "#f5f5f5",
+          padding: "20px",
+          borderRadius: "8px",
+          overflow: "auto",
+          whiteSpace: "pre-wrap",
+        }}
+      >
+        {JSON.stringify(data, null, 2)}
+      </pre>
+    </main>
+  );
 }
