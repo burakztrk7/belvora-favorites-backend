@@ -2,12 +2,11 @@
 
 client_id = "e3798cbf35de4af92aae9a3bea4d69d8"
 name = "backend"
-application_url = "https://example.com"
+application_url = "https://belvora-favorites-backend-production.up.railway.app"
 embedded = true
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_customers,read_customers,write_app_proxy"
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_customers,read_customers,read_orders,write_app_proxy"
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
@@ -45,11 +44,13 @@ api_version = "2026-10"
   topics = [ "app/scopes_update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [
+  "https://belvora-favorites-backend-production.up.railway.app/auth/callback"
+]
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true
+
 [app_proxy]
 url = "/apps/belvora-favorites"
 subpath = "belvora-favorites"
