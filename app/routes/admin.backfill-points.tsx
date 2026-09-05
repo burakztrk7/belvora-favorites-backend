@@ -3,23 +3,38 @@ import type {LoaderFunctionArgs} from "react-router";
 import {useLoaderData} from "react-router";
 import {unauthenticated} from "../shopify.server";
 
+type CustomerPoints = {
+  customerId: string;
+  eligibleOrders: number;
+  totalSpent: number;
+  pointsToGive: number;
+};
+
 export async function loader({request}: LoaderFunctionArgs) {
+  // --------------------------------------------------
+  // 1. SECRET KONTROLÜ
+  // --------------------------------------------------
+
   const url = new URL(request.url);
 
   const secret = url.searchParams.get("secret");
   const expectedSecret = process.env.BACKFILL_SECRET;
 
   if (!expectedSecret) {
-    throw new Response("BACKFILL_SECRET Railway'den gelmiyor", {
+    throw new Response("BACKFILL_SECRET tanımlı değil.", {
       status: 500,
     });
   }
 
   if (secret !== expectedSecret) {
-    throw new Response("Yetkisiz erişim", {
+    throw new Response("Yetkisiz erişim.", {
       status: 401,
     });
   }
+
+  // --------------------------------------------------
+  // 2. SHOPIFY OFFLINE SESSION BUL
+  // --------------------------------------------------
 
   const offlineSession = await prisma.session.findFirst({
     where: {
@@ -31,85 +46,139 @@ export async function loader({request}: LoaderFunctionArgs) {
   });
 
   if (!offlineSession?.shop) {
-    throw new Response("Shopify offline session bulunamadı", {
+    throw new Response("Shopify offline session bulunamadı.", {
       status: 500,
     });
   }
 
-  const {admin} = await unauthenticated.admin(offlineSession.shop);
+  const {admin} = await unauthenticated.admin(
+    offlineSession.shop
+  );
 
-  const response = await admin.graphql(`
-    query BackfillPreview {
-      orders(
-        first: 250
-        sortKey: CREATED_AT
-        reverse: true
-      ) {
-        nodes {
-          id
-          name
-          cancelledAt
-          displayFinancialStatus
+  // --------------------------------------------------
+  // 3. TÜM SİPARİŞLERİ PAGINATION İLE ÇEK
+  // --------------------------------------------------
 
-          currentTotalPriceSet {
-            shopMoney {
-              amount
-              currencyCode
+  const allOrders: any[] = [];
+
+  let hasNextPage = true;
+  let cursor: string | null = null;
+
+  while (hasNextPage) {
+    const response = await admin.graphql(
+      `
+        query BelvoraLoyaltyOrders($cursor: String) {
+          orders(
+            first: 100
+            after: $cursor
+            sortKey: CREATED_AT
+            reverse: false
+          ) {
+            nodes {
+              id
+              name
+              createdAt
+              cancelledAt
+              displayFinancialStatus
+
+              currentTotalPriceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+
+              customer {
+                id
+              }
+            }
+
+            pageInfo {
+              hasNextPage
+              endCursor
             }
           }
-
-          customer {
-            id
-          }
         }
+      `,
+      {
+        variables: {
+          cursor,
+        },
       }
+    );
+
+    const json = await response.json();
+
+    if (json.errors?.length) {
+      return {
+        ok: false,
+        errors: json.errors,
+        scannedOrderCount: allOrders.length,
+        eligibleOrderCount: 0,
+        customerCount: 0,
+        totalPointsToGive: 0,
+        customers: [],
+      };
     }
-  `);
 
-  const json = await response.json();
+    const connection = json.data?.orders;
 
-  if (json.errors?.length) {
-    return {
-      ok: false,
-      errors: json.errors,
-      customerCount: 0,
-      customers: [],
-    };
+    const nodes = connection?.nodes || [];
+
+    allOrders.push(...nodes);
+
+    hasNextPage = Boolean(
+      connection?.pageInfo?.hasNextPage
+    );
+
+    cursor =
+      connection?.pageInfo?.endCursor || null;
   }
 
-  const orders = json.data?.orders?.nodes || [];
+  // --------------------------------------------------
+  // 4. UYGUN SİPARİŞLERİ MÜŞTERİYE GÖRE TOPLA
+  // --------------------------------------------------
 
-  const customerTotals = new Map<
-    string,
-    {
-      customerId: string;
-      eligibleOrders: number;
-      totalSpent: number;
-      pointsToGive: number;
-    }
-  >();
+  const customerTotals = new Map<string, CustomerPoints>();
 
-  for (const order of orders) {
+  let eligibleOrderCount = 0;
+
+  for (const order of allOrders) {
     const customerId = order.customer?.id;
 
-    if (!customerId) continue;
-    if (order.cancelledAt) continue;
+    // Müşteriye bağlı olmayan siparişi geç
+    if (!customerId) {
+      continue;
+    }
+
+    // İptal edilmiş siparişi geç
+    if (order.cancelledAt) {
+      continue;
+    }
 
     const financialStatus = String(
       order.displayFinancialStatus || ""
     ).toUpperCase();
 
-    const eligible =
+    // Sadece ödenmiş siparişler
+    const isEligible =
       financialStatus === "PAID" ||
       financialStatus === "PARTIALLY_REFUNDED";
 
-    if (!eligible) continue;
+    if (!isEligible) {
+      continue;
+    }
 
+    // İadeler sonrası mevcut sipariş tutarı
     const amount = Number(
       order.currentTotalPriceSet?.shopMoney?.amount || 0
     );
 
-    if (!Number.isFinite(amount) || amount <= 0) continue;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      continue;
+    }
+
+    eligibleOrderCount += 1;
 
     const current =
       customerTotals.get(customerId) || {
@@ -124,6 +193,11 @@ export async function loader({request}: LoaderFunctionArgs) {
 
     customerTotals.set(customerId, current);
   }
+
+  // --------------------------------------------------
+  // 5. PUANI HESAPLA
+  // 1 TL = 1 PUAN
+  // --------------------------------------------------
 
   const result = Array.from(customerTotals.values())
     .map((customer) => {
@@ -141,9 +215,26 @@ export async function loader({request}: LoaderFunctionArgs) {
     .filter((customer) => customer.pointsToGive > 0)
     .sort((a, b) => b.pointsToGive - a.pointsToGive);
 
+  const totalPointsToGive = result.reduce(
+    (sum, customer) => sum + customer.pointsToGive,
+    0
+  );
+
+  // --------------------------------------------------
+  // 6. SADECE ÖNİZLEME
+  // HENÜZ METAFIELD YAZMIYORUZ
+  // --------------------------------------------------
+
   return {
     ok: true,
+
+    scannedOrderCount: allOrders.length,
+    eligibleOrderCount,
+
     customerCount: result.length,
+
+    totalPointsToGive,
+
     customers: result,
   };
 }
@@ -154,35 +245,108 @@ export default function BackfillPreview() {
   return (
     <main
       style={{
-        fontFamily: "Arial, sans-serif",
-        maxWidth: "1000px",
+        fontFamily:
+          'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        maxWidth: "1100px",
         margin: "40px auto",
-        padding: "20px",
+        padding: "24px",
+        color: "#241b1b",
       }}
     >
-      <h1>Belvora Club — Puan Önizlemesi</h1>
+      <h1
+        style={{
+          marginBottom: "8px",
+        }}
+      >
+        Belvora Club — Puan Önizlemesi
+      </h1>
 
       <p>
-        Bu ekran yalnızca geçmiş siparişlerden puan
-        hesaplıyor. Henüz müşterilere puan yazılmıyor.
+        Bu ekran yalnızca hesaplama yapıyor.
+        Henüz hiçbir müşterinin puan bakiyesi değiştirilmiyor.
       </p>
 
-      <p>
-        Uygun müşteri sayısı:{" "}
-        <strong>{data.customerCount}</strong>
-      </p>
+      {"scannedOrderCount" in data && (
+        <div
+          style={{
+            display: "flex",
+            gap: "16px",
+            flexWrap: "wrap",
+            margin: "28px 0",
+          }}
+        >
+          <StatBox
+            title="Taranan Sipariş"
+            value={data.scannedOrderCount}
+          />
+
+          <StatBox
+            title="Uygun Sipariş"
+            value={data.eligibleOrderCount}
+          />
+
+          <StatBox
+            title="Puan Alacak Müşteri"
+            value={data.customerCount}
+          />
+
+          <StatBox
+            title="Toplam Dağıtılacak Puan"
+            value={data.totalPointsToGive}
+          />
+        </div>
+      )}
 
       <pre
         style={{
-          background: "#f4f4f4",
-          padding: "20px",
-          borderRadius: "8px",
+          background: "#f7f4f2",
+          padding: "22px",
+          borderRadius: "12px",
           overflow: "auto",
           whiteSpace: "pre-wrap",
+          lineHeight: "1.5",
         }}
       >
         {JSON.stringify(data, null, 2)}
       </pre>
     </main>
+  );
+}
+
+function StatBox({
+  title,
+  value,
+}: {
+  title: string;
+  value: number;
+}) {
+  return (
+    <div
+      style={{
+        minWidth: "180px",
+        padding: "18px",
+        border: "1px solid #eadfd9",
+        borderRadius: "12px",
+        background: "#fffaf7",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "13px",
+          opacity: 0.65,
+          marginBottom: "6px",
+        }}
+      >
+        {title}
+      </div>
+
+      <strong
+        style={{
+          fontSize: "24px",
+        }}
+      >
+        {new Intl.NumberFormat("tr-TR").format(value)}
+      </strong>
+    </div>
   );
 }
