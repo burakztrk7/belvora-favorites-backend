@@ -1,3 +1,4 @@
+import prisma from "../db.server";
 import type {LoaderFunctionArgs} from "react-router";
 import {useLoaderData} from "react-router";
 import {unauthenticated} from "../shopify.server";
@@ -21,13 +22,22 @@ if (secret !== expectedSecret) {
   );
 }
 
-  const shop = process.env.SHOP_DOMAIN;
+const offlineSession = await prisma.session.findFirst({
+  where: {
+    isOnline: false,
+  },
+  orderBy: {
+    id: "desc",
+  },
+});
 
-  if (!shop) {
-    throw new Response("SHOP_DOMAIN tanımlı değil", {status: 500});
-  }
+if (!offlineSession?.shop) {
+  throw new Response("Shopify offline session bulunamadı", {
+    status: 500,
+  });
+}
 
-  const {admin} = await unauthenticated.admin(shop);
+const {admin} = await unauthenticated.admin(offlineSession.shop);
 
   const response = await admin.graphql(`
     query BackfillPreview {
