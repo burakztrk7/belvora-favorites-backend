@@ -321,7 +321,7 @@ export async function action({
 
   const formData = await request.formData();
 
-  if (formData.get("action") !== "apply-backfill") {
+  if (formData.get("intent") !== "apply-backfill") {
     throw new Response("Geçersiz işlem.", {
       status: 400,
     });
@@ -525,12 +525,12 @@ export default function BackfillPage() {
       )}
 
       {data.willApplyCount > 0 && (
-        <Form method="post">
-          <input
-            type="hidden"
-            name="action"
-            value="apply-backfill"
-          />
+       <Form method="post" action={window.location.href}>
+  <input
+    type="hidden"
+    name="intent"
+    value="apply-backfill"
+  />
 
           <button
             type="submit"
