@@ -100,7 +100,7 @@ const {admin} = await unauthenticated.admin(offlineSession.shop);
       totalSpent: Number(totalSpent.toFixed(2)),
       pointsToGive: Math.floor(totalSpent),
     };
-  });
+ }).filter((customer: any) => customer.pointsToGive > 0);
 
   return {
     ok: true,
