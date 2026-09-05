@@ -1,17 +1,30 @@
 import type {LoaderFunctionArgs} from "react-router";
 import {useLoaderData} from "react-router";
-import {authenticate} from "../shopify.server";
+import {unauthenticated} from "../shopify.server";
 
 export async function loader({request}: LoaderFunctionArgs) {
-  const {admin, session} = await authenticate.admin(request);
+  const url = new URL(request.url);
+
+  const secret = url.searchParams.get("secret");
+  const expectedSecret = process.env.BACKFILL_SECRET;
+
+  if (!expectedSecret || secret !== expectedSecret) {
+    throw new Response("Yetkisiz erişim", {status: 401});
+  }
+
+  const shop = process.env.SHOP_DOMAIN;
+
+  if (!shop) {
+    throw new Response("SHOP_DOMAIN tanımlı değil", {status: 500});
+  }
+
+  const {admin} = await unauthenticated.admin(shop);
 
   const response = await admin.graphql(`
-    query BackfillCustomers {
+    query BackfillPreview {
       customers(first: 50) {
         nodes {
           id
-          firstName
-          lastName
 
           orders(first: 100) {
             nodes {
@@ -63,19 +76,15 @@ export async function loader({request}: LoaderFunctionArgs) {
     );
 
     return {
-      name:
-        [customer.firstName, customer.lastName]
-          .filter(Boolean)
-          .join(" ") || "İsimsiz müşteri",
+      customerId: customer.id,
       eligibleOrders: eligibleOrders.length,
-      totalSpent: Math.round(totalSpent * 100) / 100,
+      totalSpent: Number(totalSpent.toFixed(2)),
       pointsToGive: Math.floor(totalSpent),
     };
   });
 
   return {
     ok: true,
-    shop: session.shop,
     customerCount: result.length,
     customers: result,
   };
@@ -93,16 +102,15 @@ export default function BackfillPreview() {
         padding: "20px",
       }}
     >
-      <h1>Belvora Club — Geçmiş Puan Önizlemesi</h1>
+      <h1>Belvora Club — Puan Önizlemesi</h1>
 
       <p>
-        Bu sayfa yalnızca hesaplama yapar. Henüz müşterilere puan
-        yazılmaz.
+        Henüz hiçbir müşteriye puan yazılmıyor.
       </p>
 
       <pre
         style={{
-          background: "#f5f5f5",
+          background: "#f4f4f4",
           padding: "20px",
           borderRadius: "8px",
           overflow: "auto",
