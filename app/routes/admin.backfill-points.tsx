@@ -40,25 +40,28 @@ async function getAdmin() {
   return admin;
 }
 
-function checkSecret(request: Request) {
+function getSecret(request: Request) {
   const url = new URL(request.url);
 
-  const supplied = url.searchParams.get("secret");
-  const expected = process.env.BACKFILL_SECRET;
+  const suppliedSecret = url.searchParams.get("secret");
+  const expectedSecret = process.env.BACKFILL_SECRET;
 
-  if (!expected) {
+  if (!expectedSecret) {
     throw new Response("BACKFILL_SECRET tanımlı değil.", {
       status: 500,
     });
   }
 
-  if (supplied !== expected) {
+  if (suppliedSecret !== expectedSecret) {
     throw new Response("Yetkisiz erişim.", {
       status: 401,
     });
   }
 
-  return supplied;
+  return {
+    secret: suppliedSecret,
+    pathname: url.pathname,
+  };
 }
 
 async function calculateBackfill(admin: any) {
@@ -180,7 +183,8 @@ async function calculateBackfill(admin: any) {
       );
 
       return {
-        ...customer,
+        customerId: customer.customerId,
+        eligibleOrders: customer.eligibleOrders,
         totalSpent,
         pointsToGive: Math.floor(totalSpent),
       };
@@ -254,7 +258,7 @@ async function getExistingPoints(
 export async function loader({
   request,
 }: LoaderFunctionArgs) {
-  checkSecret(request);
+  const {secret, pathname} = getSecret(request);
 
   const admin = await getAdmin();
 
@@ -297,6 +301,10 @@ export async function loader({
   return {
     ok: true,
 
+    actionUrl: `${pathname}?secret=${encodeURIComponent(
+      secret || ""
+    )}`,
+
     scannedOrderCount:
       calculation.scannedOrderCount,
 
@@ -317,7 +325,7 @@ export async function loader({
 export async function action({
   request,
 }: ActionFunctionArgs) {
-  checkSecret(request);
+  getSecret(request);
 
   const formData = await request.formData();
 
@@ -329,7 +337,6 @@ export async function action({
 
   const admin = await getAdmin();
 
-  // Her basışta siparişlerden tekrar hesaplıyoruz.
   const calculation = await calculateBackfill(admin);
 
   const existingPoints = await getExistingPoints(
@@ -339,7 +346,6 @@ export async function action({
     )
   );
 
-  // Mevcut puanı olan müşteriye dokunma.
   const customersToWrite =
     calculation.customers.filter(
       (customer) =>
@@ -347,13 +353,13 @@ export async function action({
     );
 
   let written = 0;
-  let skipped =
+
+  const skipped =
     calculation.customers.length -
     customersToWrite.length;
 
   const errors: string[] = [];
 
-  // metafieldsSet işlemlerini küçük batch'ler halinde yap.
   for (let i = 0; i < customersToWrite.length; i += 20) {
     const batch = customersToWrite.slice(i, i + 20);
 
@@ -365,8 +371,6 @@ export async function action({
           metafieldsSet(metafields: $metafields) {
             metafields {
               id
-              namespace
-              key
               value
             }
 
@@ -525,12 +529,15 @@ export default function BackfillPage() {
       )}
 
       {data.willApplyCount > 0 && (
-       <Form method="post" action={window.location.href}>
-  <input
-    type="hidden"
-    name="intent"
-    value="apply-backfill"
-  />
+        <Form
+          method="post"
+          action={data.actionUrl}
+        >
+          <input
+            type="hidden"
+            name="intent"
+            value="apply-backfill"
+          />
 
           <button
             type="submit"
@@ -545,17 +552,6 @@ export default function BackfillPage() {
               cursor: "pointer",
               marginBottom: "28px",
             }}
-            onClick={(event) => {
-              const confirmed = window.confirm(
-                `${data.willApplyCount} müşteriye toplam ${data.totalPointsToApply.toLocaleString(
-                  "tr-TR"
-                )} Belvora Puan yüklenecek. Emin misiniz?`
-              );
-
-              if (!confirmed) {
-                event.preventDefault();
-              }
-            }}
           >
             Puanları Uygula
           </button>
@@ -563,8 +559,9 @@ export default function BackfillPage() {
       )}
 
       <p>
-        <strong>Güvenlik:</strong> Mevcut Belvora Puanı
-        0'dan büyük müşteriler otomatik atlanır.
+        <strong>Güvenlik:</strong>{" "}
+        Mevcut Belvora Puanı 0'dan büyük olan
+        müşteriler otomatik olarak atlanır.
       </p>
 
       <pre
@@ -577,7 +574,11 @@ export default function BackfillPage() {
           lineHeight: 1.45,
         }}
       >
-        {JSON.stringify(data.customers, null, 2)}
+        {JSON.stringify(
+          data.customers,
+          null,
+          2
+        )}
       </pre>
     </main>
   );
