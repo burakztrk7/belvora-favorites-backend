@@ -10,55 +10,56 @@ export async function loader({request}: LoaderFunctionArgs) {
   const expectedSecret = process.env.BACKFILL_SECRET;
 
   if (!expectedSecret) {
-  throw new Response("BACKFILL_SECRET Railway'den gelmiyor", {
-    status: 500,
+    throw new Response("BACKFILL_SECRET Railway'den gelmiyor", {
+      status: 500,
+    });
+  }
+
+  if (secret !== expectedSecret) {
+    throw new Response("Yetkisiz erişim", {
+      status: 401,
+    });
+  }
+
+  const offlineSession = await prisma.session.findFirst({
+    where: {
+      isOnline: false,
+    },
+    orderBy: {
+      id: "desc",
+    },
   });
-}
 
-if (secret !== expectedSecret) {
-  throw new Response(
-    `Secret eşleşmiyor. URL uzunluğu: ${secret?.length || 0}, Railway uzunluğu: ${expectedSecret.length}`,
-    {status: 401}
-  );
-}
+  if (!offlineSession?.shop) {
+    throw new Response("Shopify offline session bulunamadı", {
+      status: 500,
+    });
+  }
 
-const offlineSession = await prisma.session.findFirst({
-  where: {
-    isOnline: false,
-  },
-  orderBy: {
-    id: "desc",
-  },
-});
-
-if (!offlineSession?.shop) {
-  throw new Response("Shopify offline session bulunamadı", {
-    status: 500,
-  });
-}
-
-const {admin} = await unauthenticated.admin(offlineSession.shop);
+  const {admin} = await unauthenticated.admin(offlineSession.shop);
 
   const response = await admin.graphql(`
     query BackfillPreview {
-      customers(first: 50) {
+      orders(
+        first: 250
+        sortKey: CREATED_AT
+        reverse: true
+      ) {
         nodes {
           id
+          name
+          cancelledAt
+          displayFinancialStatus
 
-          orders(first: 100) {
-            nodes {
-              id
-              name
-              cancelledAt
-              displayFinancialStatus
-
-              totalPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
+          currentTotalPriceSet {
+            shopMoney {
+              amount
+              currencyCode
             }
+          }
+
+          customer {
+            id
           }
         }
       }
@@ -71,36 +72,74 @@ const {admin} = await unauthenticated.admin(offlineSession.shop);
     return {
       ok: false,
       errors: json.errors,
+      customerCount: 0,
       customers: [],
     };
   }
 
-  const customers = json.data?.customers?.nodes || [];
+  const orders = json.data?.orders?.nodes || [];
 
-  const result = customers.map((customer: any) => {
-    const eligibleOrders = (customer.orders?.nodes || []).filter(
-      (order: any) => {
-        const paid =
-          order.displayFinancialStatus === "PAID" ||
-          order.displayFinancialStatus === "PARTIALLY_REFUNDED";
+  const customerTotals = new Map<
+    string,
+    {
+      customerId: string;
+      eligibleOrders: number;
+      totalSpent: number;
+      pointsToGive: number;
+    }
+  >();
 
-        return paid && !order.cancelledAt;
-      }
+  for (const order of orders) {
+    const customerId = order.customer?.id;
+
+    if (!customerId) continue;
+    if (order.cancelledAt) continue;
+
+    const financialStatus = String(
+      order.displayFinancialStatus || ""
+    ).toUpperCase();
+
+    const eligible =
+      financialStatus === "PAID" ||
+      financialStatus === "PARTIALLY_REFUNDED";
+
+    if (!eligible) continue;
+
+    const amount = Number(
+      order.currentTotalPriceSet?.shopMoney?.amount || 0
     );
 
-    const totalSpent = eligibleOrders.reduce(
-      (sum: number, order: any) =>
-        sum + Number(order.totalPriceSet?.shopMoney?.amount || 0),
-      0
-    );
+    if (!Number.isFinite(amount) || amount <= 0) continue;
 
-    return {
-      customerId: customer.id,
-      eligibleOrders: eligibleOrders.length,
-      totalSpent: Number(totalSpent.toFixed(2)),
-      pointsToGive: Math.floor(totalSpent),
-    };
- }).filter((customer: any) => customer.pointsToGive > 0);
+    const current =
+      customerTotals.get(customerId) || {
+        customerId,
+        eligibleOrders: 0,
+        totalSpent: 0,
+        pointsToGive: 0,
+      };
+
+    current.eligibleOrders += 1;
+    current.totalSpent += amount;
+
+    customerTotals.set(customerId, current);
+  }
+
+  const result = Array.from(customerTotals.values())
+    .map((customer) => {
+      const totalSpent = Number(
+        customer.totalSpent.toFixed(2)
+      );
+
+      return {
+        customerId: customer.customerId,
+        eligibleOrders: customer.eligibleOrders,
+        totalSpent,
+        pointsToGive: Math.floor(totalSpent),
+      };
+    })
+    .filter((customer) => customer.pointsToGive > 0)
+    .sort((a, b) => b.pointsToGive - a.pointsToGive);
 
   return {
     ok: true,
@@ -116,7 +155,7 @@ export default function BackfillPreview() {
     <main
       style={{
         fontFamily: "Arial, sans-serif",
-        maxWidth: "900px",
+        maxWidth: "1000px",
         margin: "40px auto",
         padding: "20px",
       }}
@@ -124,7 +163,13 @@ export default function BackfillPreview() {
       <h1>Belvora Club — Puan Önizlemesi</h1>
 
       <p>
-        Henüz hiçbir müşteriye puan yazılmıyor.
+        Bu ekran yalnızca geçmiş siparişlerden puan
+        hesaplıyor. Henüz müşterilere puan yazılmıyor.
+      </p>
+
+      <p>
+        Uygun müşteri sayısı:{" "}
+        <strong>{data.customerCount}</strong>
       </p>
 
       <pre
