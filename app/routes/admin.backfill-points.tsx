@@ -1,12 +1,6 @@
 import prisma from "../db.server";
-import type {
-  ActionFunctionArgs,
-  LoaderFunctionArgs,
-} from "react-router";
-import {
-  useActionData,
-  useLoaderData,
-} from "react-router";
+import type {LoaderFunctionArgs} from "react-router";
+import {useLoaderData} from "react-router";
 import {unauthenticated} from "../shopify.server";
 
 type CustomerPoints = {
@@ -39,27 +33,27 @@ async function getAdmin() {
   return admin;
 }
 
-function getSecretInfo(request: Request) {
+function checkSecret(request: Request) {
   const url = new URL(request.url);
 
-  const secret = url.searchParams.get("secret");
-  const expectedSecret = process.env.BACKFILL_SECRET;
+  const supplied = url.searchParams.get("secret");
+  const expected = process.env.BACKFILL_SECRET;
 
-  if (!expectedSecret) {
+  if (!expected) {
     throw new Response("BACKFILL_SECRET tanımlı değil.", {
       status: 500,
     });
   }
 
-  if (secret !== expectedSecret) {
+  if (supplied !== expected) {
     throw new Response("Yetkisiz erişim.", {
       status: 401,
     });
   }
 
   return {
-    secret,
-    pathname: url.pathname,
+    secret: supplied,
+    apply: url.searchParams.get("apply"),
   };
 }
 
@@ -127,8 +121,7 @@ async function calculateBackfill(admin: any) {
       connection?.pageInfo?.hasNextPage
     );
 
-    cursor =
-      connection?.pageInfo?.endCursor || null;
+    cursor = connection?.pageInfo?.endCursor || null;
   }
 
   const totals = new Map<string, CustomerPoints>();
@@ -225,9 +218,7 @@ async function getExistingPoints(
         }
       `,
       {
-        variables: {
-          ids,
-        },
+        variables: {ids},
       }
     );
 
@@ -254,115 +245,15 @@ async function getExistingPoints(
   return pointMap;
 }
 
-export async function loader({
-  request,
-}: LoaderFunctionArgs) {
-  const {secret, pathname} = getSecretInfo(request);
-
-  const admin = await getAdmin();
-
-  const calculation = await calculateBackfill(admin);
-
-  const existingPoints = await getExistingPoints(
-    admin,
-    calculation.customers.map(
-      (customer) => customer.customerId
-    )
-  );
-
-  const customers = calculation.customers.map(
-    (customer) => {
-      const currentPoints =
-        existingPoints.get(customer.customerId) || 0;
-
-      return {
-        ...customer,
-        currentPoints,
-        willApply: currentPoints <= 0,
-      };
-    }
-  );
-
-  const willApplyCount = customers.filter(
-    (customer) => customer.willApply
-  ).length;
-
-  const skippedCount =
-    customers.length - willApplyCount;
-
-  const totalPointsToApply = customers
-    .filter((customer) => customer.willApply)
-    .reduce(
-      (sum, customer) => sum + customer.pointsToGive,
-      0
-    );
-
-  return {
-    ok: true,
-
-    actionUrl: `${pathname}?secret=${encodeURIComponent(
-      secret || ""
-    )}`,
-
-    scannedOrderCount:
-      calculation.scannedOrderCount,
-
-    eligibleOrderCount:
-      calculation.eligibleOrderCount,
-
-    eligibleCustomerCount:
-      customers.length,
-
-    willApplyCount,
-    skippedCount,
-    totalPointsToApply,
-
-    customers,
-  };
-}
-
-export async function action({
-  request,
-}: ActionFunctionArgs) {
-  getSecretInfo(request);
-
-  const formData = await request.formData();
-
-  const intent = formData.get("intent");
-
-  if (intent !== "apply-backfill") {
-    return new Response("Geçersiz işlem.", {
-      status: 400,
-    });
-  }
-
-  const admin = await getAdmin();
-
-  const calculation = await calculateBackfill(admin);
-
-  const existingPoints = await getExistingPoints(
-    admin,
-    calculation.customers.map(
-      (customer) => customer.customerId
-    )
-  );
-
-  const customersToWrite =
-    calculation.customers.filter(
-      (customer) =>
-        (existingPoints.get(customer.customerId) || 0) <= 0
-    );
-
+async function writePoints(
+  admin: any,
+  customers: CustomerPoints[]
+) {
   let written = 0;
-
-  const skipped =
-    calculation.customers.length -
-    customersToWrite.length;
-
   const errors: string[] = [];
 
-  for (let i = 0; i < customersToWrite.length; i += 20) {
-    const batch = customersToWrite.slice(i, i + 20);
+  for (let i = 0; i < customers.length; i += 20) {
+    const batch = customers.slice(i, i + 20);
 
     const response = await admin.graphql(
       `
@@ -403,7 +294,6 @@ export async function action({
           (error: any) => error.message
         )
       );
-
       continue;
     }
 
@@ -416,7 +306,6 @@ export async function action({
           (error: any) => error.message
         )
       );
-
       continue;
     }
 
@@ -424,18 +313,124 @@ export async function action({
   }
 
   return {
-    ok: errors.length === 0,
     written,
-    skipped,
-    totalEligible:
-      calculation.customers.length,
     errors,
+  };
+}
+
+export async function loader({
+  request,
+}: LoaderFunctionArgs) {
+  const {secret, apply} = checkSecret(request);
+
+  const admin = await getAdmin();
+
+  const calculation = await calculateBackfill(admin);
+
+  let existingPoints = await getExistingPoints(
+    admin,
+    calculation.customers.map(
+      (customer) => customer.customerId
+    )
+  );
+
+  let customersToWrite =
+    calculation.customers.filter(
+      (customer) =>
+        (existingPoints.get(customer.customerId) || 0) <= 0
+    );
+
+  let result:
+    | {
+        written: number;
+        skipped: number;
+        errors: string[];
+      }
+    | null = null;
+
+  // SADECE açıkça bu parametreyle gelirse yaz.
+  if (apply === "belvora-confirm") {
+    const writeResult = await writePoints(
+      admin,
+      customersToWrite
+    );
+
+    result = {
+      written: writeResult.written,
+      skipped:
+        calculation.customers.length -
+        customersToWrite.length,
+      errors: writeResult.errors,
+    };
+
+    // Yazdıktan sonra değerleri yeniden oku.
+    existingPoints = await getExistingPoints(
+      admin,
+      calculation.customers.map(
+        (customer) => customer.customerId
+      )
+    );
+
+    customersToWrite =
+      calculation.customers.filter(
+        (customer) =>
+          (existingPoints.get(customer.customerId) || 0) <= 0
+      );
+  }
+
+  const customers = calculation.customers.map(
+    (customer) => {
+      const currentPoints =
+        existingPoints.get(customer.customerId) || 0;
+
+      return {
+        ...customer,
+        currentPoints,
+        willApply: currentPoints <= 0,
+      };
+    }
+  );
+
+  const totalPointsToApply = customers
+    .filter((customer) => customer.willApply)
+    .reduce(
+      (sum, customer) => sum + customer.pointsToGive,
+      0
+    );
+
+  return {
+    ok: true,
+    secret,
+
+    scannedOrderCount:
+      calculation.scannedOrderCount,
+
+    eligibleOrderCount:
+      calculation.eligibleOrderCount,
+
+    eligibleCustomerCount:
+      customers.length,
+
+    willApplyCount:
+      customers.filter((c) => c.willApply).length,
+
+    skippedCount:
+      customers.filter((c) => !c.willApply).length,
+
+    totalPointsToApply,
+
+    result,
+    customers,
   };
 }
 
 export default function BackfillPage() {
   const data = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>();
+
+  const applyUrl =
+    `/admin/backfill-points` +
+    `?secret=${encodeURIComponent(data.secret || "")}` +
+    `&apply=belvora-confirm`;
 
   return (
     <main
@@ -448,9 +443,7 @@ export default function BackfillPage() {
         color: "#2f2424",
       }}
     >
-      <h1>
-        Belvora Club — Geçmiş Puan Yükleme
-      </h1>
+      <h1>Belvora Club — Geçmiş Puan Yükleme</h1>
 
       <p>
         1 TL uygun geçmiş harcama = 1 Belvora Puan.
@@ -495,7 +488,7 @@ export default function BackfillPage() {
         />
       </div>
 
-      {actionData && (
+      {data.result && (
         <div
           style={{
             padding: "18px",
@@ -505,22 +498,20 @@ export default function BackfillPage() {
             background: "#fffaf7",
           }}
         >
-          <strong>İşlem sonucu</strong>
+          <strong>İşlem tamamlandı</strong>
 
           <p>
-            Puan yazılan müşteri:{" "}
-            {actionData.written}
+            Puan yazılan müşteri: {data.result.written}
           </p>
 
           <p>
-            Atlanan müşteri:{" "}
-            {actionData.skipped}
+            Atlanan müşteri: {data.result.skipped}
           </p>
 
-          {actionData.errors?.length > 0 && (
+          {data.result.errors.length > 0 && (
             <pre>
               {JSON.stringify(
-                actionData.errors,
+                data.result.errors,
                 null,
                 2
               )}
@@ -530,39 +521,41 @@ export default function BackfillPage() {
       )}
 
       {data.willApplyCount > 0 && (
-        <form
-          method="post"
-          action={data.actionUrl}
+        <a
+          href={applyUrl}
+          style={{
+            display: "inline-block",
+            textDecoration: "none",
+            background: "#4a302f",
+            color: "#ffffff",
+            borderRadius: "8px",
+            padding: "13px 22px",
+            fontSize: "15px",
+            fontWeight: 600,
+            marginBottom: "28px",
+          }}
         >
-          <input
-            type="hidden"
-            name="intent"
-            value="apply-backfill"
-          />
+          Puanları Uygula
+        </a>
+      )}
 
-          <button
-            type="submit"
-            style={{
-              background: "#4a302f",
-              color: "white",
-              border: 0,
-              borderRadius: "8px",
-              padding: "13px 22px",
-              fontSize: "15px",
-              fontWeight: 600,
-              cursor: "pointer",
-              marginBottom: "28px",
-            }}
-          >
-            Puanları Uygula
-          </button>
-        </form>
+      {data.willApplyCount === 0 && (
+        <div
+          style={{
+            padding: "16px",
+            background: "#f2f7f2",
+            borderRadius: "10px",
+            marginBottom: "24px",
+          }}
+        >
+          Tüm uygun müşterilerin geçmiş puanları
+          yüklenmiş durumda.
+        </div>
       )}
 
       <p>
-        <strong>Güvenlik:</strong>{" "}
-        Mevcut Belvora Puanı 0'dan büyük olan
-        müşteriler otomatik olarak atlanır.
+        <strong>Güvenlik:</strong> Mevcut Belvora Puanı
+        0'dan büyük müşteriler tekrar yazılmaz.
       </p>
 
       <pre
@@ -575,11 +568,7 @@ export default function BackfillPage() {
           lineHeight: 1.45,
         }}
       >
-        {JSON.stringify(
-          data.customers,
-          null,
-          2
-        )}
+        {JSON.stringify(data.customers, null, 2)}
       </pre>
     </main>
   );
