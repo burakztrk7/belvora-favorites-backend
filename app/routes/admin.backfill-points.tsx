@@ -4,7 +4,6 @@ import type {
   LoaderFunctionArgs,
 } from "react-router";
 import {
-  Form,
   useActionData,
   useLoaderData,
 } from "react-router";
@@ -40,10 +39,10 @@ async function getAdmin() {
   return admin;
 }
 
-function getSecret(request: Request) {
+function getSecretInfo(request: Request) {
   const url = new URL(request.url);
 
-  const suppliedSecret = url.searchParams.get("secret");
+  const secret = url.searchParams.get("secret");
   const expectedSecret = process.env.BACKFILL_SECRET;
 
   if (!expectedSecret) {
@@ -52,14 +51,14 @@ function getSecret(request: Request) {
     });
   }
 
-  if (suppliedSecret !== expectedSecret) {
+  if (secret !== expectedSecret) {
     throw new Response("Yetkisiz erişim.", {
       status: 401,
     });
   }
 
   return {
-    secret: suppliedSecret,
+    secret,
     pathname: url.pathname,
   };
 }
@@ -258,7 +257,7 @@ async function getExistingPoints(
 export async function loader({
   request,
 }: LoaderFunctionArgs) {
-  const {secret, pathname} = getSecret(request);
+  const {secret, pathname} = getSecretInfo(request);
 
   const admin = await getAdmin();
 
@@ -325,12 +324,14 @@ export async function loader({
 export async function action({
   request,
 }: ActionFunctionArgs) {
-  getSecret(request);
+  getSecretInfo(request);
 
   const formData = await request.formData();
 
-  if (formData.get("intent") !== "apply-backfill") {
-    throw new Response("Geçersiz işlem.", {
+  const intent = formData.get("intent");
+
+  if (intent !== "apply-backfill") {
+    return new Response("Geçersiz işlem.", {
       status: 400,
     });
   }
@@ -529,7 +530,7 @@ export default function BackfillPage() {
       )}
 
       {data.willApplyCount > 0 && (
-        <Form
+        <form
           method="post"
           action={data.actionUrl}
         >
@@ -555,7 +556,7 @@ export default function BackfillPage() {
           >
             Puanları Uygula
           </button>
-        </Form>
+        </form>
       )}
 
       <p>
