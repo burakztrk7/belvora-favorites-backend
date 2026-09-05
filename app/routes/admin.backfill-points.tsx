@@ -8,9 +8,18 @@ export async function loader({request}: LoaderFunctionArgs) {
   const secret = url.searchParams.get("secret");
   const expectedSecret = process.env.BACKFILL_SECRET;
 
-  if (!expectedSecret || secret !== expectedSecret) {
-    throw new Response("Yetkisiz erişim", {status: 401});
-  }
+  if (!expectedSecret) {
+  throw new Response("BACKFILL_SECRET Railway'den gelmiyor", {
+    status: 500,
+  });
+}
+
+if (secret !== expectedSecret) {
+  throw new Response(
+    `Secret eşleşmiyor. URL uzunluğu: ${secret?.length || 0}, Railway uzunluğu: ${expectedSecret.length}`,
+    {status: 401}
+  );
+}
 
   const shop = process.env.SHOP_DOMAIN;
 
