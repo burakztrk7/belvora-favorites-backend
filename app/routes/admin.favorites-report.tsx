@@ -6,38 +6,57 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const secret = url.searchParams.get("secret");
 
   if (!process.env.BACKFILL_SECRET || secret !== process.env.BACKFILL_SECRET) {
-    return Response.json(
-      { ok: false, error: "Unauthorized" },
-      { status: 401 },
+    return new Response(
+      JSON.stringify({ ok: false, error: "Unauthorized" }, null, 2),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+        },
+      },
     );
   }
 
   try {
     const offlineSession = await prisma.session.findFirst({
-      where: {
-        isOnline: false,
-      },
-      orderBy: {
-        id: "desc",
-      },
+      where: { isOnline: false },
+      orderBy: { id: "desc" },
     });
 
     if (!offlineSession) {
-      return Response.json(
-        { ok: false, error: "Offline Shopify session bulunamadı." },
-        { status: 500 },
+      return new Response(
+        JSON.stringify(
+          { ok: false, error: "Offline Shopify session bulunamadı." },
+          null,
+          2,
+        ),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+          },
+        },
+      );
+    }
+
+    if (!offlineSession.accessToken) {
+      return new Response(
+        JSON.stringify(
+          { ok: false, error: "Shopify access token bulunamadı." },
+          null,
+          2,
+        ),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+          },
+        },
       );
     }
 
     const shop = offlineSession.shop;
     const accessToken = offlineSession.accessToken;
-
-    if (!accessToken) {
-      return Response.json(
-        { ok: false, error: "Shopify access token bulunamadı." },
-        { status: 500 },
-      );
-    }
 
     const query = `
       query CustomersWithFavorites($cursor: String) {
@@ -56,9 +75,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
                 currencyCode
               }
               metafield(namespace: "custom", key: "favorite_products") {
-                id
-                type
-                value
                 references(first: 100) {
                   nodes {
                     ... on Product {
@@ -66,16 +82,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
                       title
                       handle
                       status
-                      featuredImage {
-                        url
-                      }
                     }
                   }
                 }
               }
             }
           }
-
           pageInfo {
             hasNextPage
           }
@@ -99,9 +111,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           },
           body: JSON.stringify({
             query,
-            variables: {
-              cursor,
-            },
+            variables: { cursor },
           }),
         },
       );
@@ -109,15 +119,22 @@ export async function loader({ request }: LoaderFunctionArgs) {
       const result = await response.json();
 
       if (!response.ok || result.errors) {
-        console.error("Shopify GraphQL error:", result);
-
-        return Response.json(
+        return new Response(
+          JSON.stringify(
+            {
+              ok: false,
+              error: "Shopify GraphQL isteği başarısız.",
+              details: result.errors ?? result,
+            },
+            null,
+            2,
+          ),
           {
-            ok: false,
-            error: "Shopify GraphQL isteği başarısız.",
-            details: result.errors ?? result,
+            status: 500,
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+            },
           },
-          { status: 500 },
         );
       }
 
@@ -128,17 +145,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
         const favoriteProducts =
           customer.metafield?.references?.nodes?.filter(Boolean) ?? [];
 
-        if (favoriteProducts.length === 0) {
-          continue;
-        }
+        if (favoriteProducts.length === 0) continue;
 
         customersWithFavorites.push({
           customerId: customer.id,
           name:
             customer.displayName ||
-            [customer.firstName, customer.lastName]
-              .filter(Boolean)
-              .join(" ") ||
+            [customer.firstName, customer.lastName].filter(Boolean).join(" ") ||
             "İsimsiz müşteri",
           email: customer.email ?? null,
           numberOfOrders: customer.numberOfOrders ?? 0,
@@ -149,7 +162,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
             title: product.title,
             handle: product.handle,
             status: product.status,
-            image: product.featuredImage?.url ?? null,
             storefrontUrl: product.handle
               ? `https://belvoraluxe.com/products/${product.handle}`
               : null,
@@ -165,9 +177,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           ? edges[edges.length - 1].cursor
           : null;
 
-      if (!cursor) {
-        hasNextPage = false;
-      }
+      if (!cursor) hasNextPage = false;
     }
 
     customersWithFavorites.sort(
@@ -186,10 +196,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
     for (const customer of customersWithFavorites) {
       for (const product of customer.favorites) {
-        const existing = productStats.get(product.productId);
+        const current = productStats.get(product.productId);
 
-        if (existing) {
-          existing.count += 1;
+        if (current) {
+          current.count += 1;
         } else {
           productStats.set(product.productId, {
             productId: product.productId,
@@ -201,39 +211,53 @@ export async function loader({ request }: LoaderFunctionArgs) {
       }
     }
 
-    const mostFavoritedProducts = Array.from(
-      productStats.values(),
-    ).sort((a, b) => b.count - a.count);
+    const mostFavoritedProducts = Array.from(productStats.values()).sort(
+      (a, b) => b.count - a.count,
+    );
 
-    return Response.json({
-      ok: true,
-      summary: {
-        customersWithFavorites: customersWithFavorites.length,
-        totalFavoriteSelections: customersWithFavorites.reduce(
-          (sum, customer) => sum + customer.favoriteCount,
-          0,
-        ),
-        uniqueFavoritedProducts: mostFavoritedProducts.length,
-      },
-      mostFavoritedProducts,
-      customers: customersWithFavorites,
-    });
-  } catch (error) {
-    console.error("Favorites report error:", error);
-
-    return Response.json(
+    return new Response(
+      JSON.stringify(
+        {
+          ok: true,
+          summary: {
+            customersWithFavorites: customersWithFavorites.length,
+            totalFavoriteSelections: customersWithFavorites.reduce(
+              (sum, customer) => sum + customer.favoriteCount,
+              0,
+            ),
+            uniqueFavoritedProducts: mostFavoritedProducts.length,
+          },
+          mostFavoritedProducts,
+          customers: customersWithFavorites,
+        },
+        null,
+        2,
+      ),
       {
-        ok: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Bilinmeyen hata oluştu.",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+        },
       },
-      { status: 500 },
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify(
+        {
+          ok: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Bilinmeyen hata oluştu.",
+        },
+        null,
+        2,
+      ),
+      {
+        status: 500,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+        },
+      },
     );
   }
-}
-
-export default function FavoritesReport() {
-  return null;
 }
