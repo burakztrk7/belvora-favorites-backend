@@ -55,3 +55,7 @@ automatically_update_urls_on_dev = true
 url = "/apps/belvora-favorites"
 subpath = "belvora-favorites"
 prefix = "apps"
+
+[[webhooks.subscriptions]]
+topics = ["orders/paid"]
+uri = "/webhooks/orders/paid"
