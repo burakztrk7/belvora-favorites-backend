@@ -6,7 +6,7 @@ application_url = "https://belvora-favorites-backend-production.up.railway.app"
 embedded = true
 
 [access_scopes]
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_customers,read_customers,read_orders,write_app_proxy"
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_customers,read_customers,read_orders,write_app_proxy,write_discounts"
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
