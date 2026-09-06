@@ -258,27 +258,91 @@ export const action = async ({
    * Aynı anda birden fazla aktif ödül
    * oluşturulmasını şimdilik engelliyoruz.
    */
-  if (pendingReservations.length > 0) {
-    return json(
-      {
-        ok: false,
-        error: "ACTIVE_REWARD_EXISTS",
-        message:
-          "Zaten aktif bir Belvora Club ödülünüz var. Önce mevcut ödülü kullanın.",
+  /*
+ * FARKLI BİR ÖDÜL SEÇİLDİYSE
+ * ESKİ PENDING ÖDÜLÜ İPTAL ET.
+ */
+if (pendingReservations.length > 0) {
+  for (const oldPending of pendingReservations) {
+    if (!oldPending.discountCode) continue;
+
+    try {
+      const lookupResponse = await admin.graphql(
+        `
+          query FindBelvoraDiscount($code: String!) {
+            codeDiscountNodeByCode(code: $code) {
+              id
+            }
+          }
+        `,
+        {
+          variables: {
+            code: oldPending.discountCode,
+          },
+        }
+      );
+
+      const lookupJson = await lookupResponse.json();
+
+      const discountNodeId =
+        lookupJson.data?.codeDiscountNodeByCode?.id;
+
+      if (discountNodeId) {
+        const deleteResponse = await admin.graphql(
+          `
+            mutation DeleteBelvoraDiscount($id: ID!) {
+              discountCodeDelete(id: $id) {
+                deletedCodeDiscountId
+
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `,
+          {
+            variables: {
+              id: discountNodeId,
+            },
+          }
+        );
+
+        const deleteJson = await deleteResponse.json();
+
+        const deleteErrors =
+          deleteJson.data?.discountCodeDelete?.userErrors || [];
+
+        if (deleteJson.errors?.length || deleteErrors.length) {
+          console.error(
+            "Eski Belvora kodu silinemedi:",
+            oldPending.discountCode,
+            deleteJson.errors,
+            deleteErrors
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        "Eski Belvora ödülü temizlenirken hata:",
+        error
+      );
+    }
+
+    await prisma.rewardTransaction.update({
+      where: {
+        id: oldPending.id,
       },
-      400
-    );
+      data: {
+        status: "REPLACED",
+      },
+    });
   }
+}
 
-  const reservedPoints =
-    pendingReservations.reduce(
-      (sum, item) =>
-        sum + Math.abs(item.points),
-      0
-    );
+  const reservedPoints = 0;
 
-  const availablePoints =
-    currentPoints - reservedPoints;
+const availablePoints = currentPoints;
 
   if (availablePoints < reward.points) {
     return json(
