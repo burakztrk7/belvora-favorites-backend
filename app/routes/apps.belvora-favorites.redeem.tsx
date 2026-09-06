@@ -1,6 +1,6 @@
 import type {ActionFunctionArgs} from "react-router";
 import prisma from "../db.server";
-import {authenticate} from "../shopify.server";
+import {authenticate, unauthenticated} from "../shopify.server";
 
 const REWARDS = {
   1000: {
@@ -36,7 +36,7 @@ function json(data: any, status = 200) {
 
 function createDiscountCode() {
   const random =
-    Math.random().toString(36).slice(2, 9).toUpperCase();
+    Math.random().toString(36).slice(2, 10).toUpperCase();
 
   return `BELVORA-${random}`;
 }
@@ -44,8 +44,7 @@ function createDiscountCode() {
 export const action = async ({
   request,
 }: ActionFunctionArgs) => {
-  const proxy =
-    await authenticate.public.appProxy(request);
+  await authenticate.public.appProxy(request);
 
   const url = new URL(request.url);
 
@@ -57,7 +56,8 @@ export const action = async ({
       {
         ok: false,
         error: "LOGIN_REQUIRED",
-        message: "Puan kullanmak için giriş yapmalısınız.",
+        message:
+          "Puan kullanmak için giriş yapmalısınız.",
       },
       401
     );
@@ -100,17 +100,13 @@ export const action = async ({
       {
         ok: false,
         error: "MINIMUM_CART",
-        message: `Bu ödül için minimum sepet tutarı ${reward.minimumCart} TL.`,
-        minimumCart: reward.minimumCart,
+        message:
+          `Bu ödül için minimum sepet tutarı ${reward.minimumCart} TL.`,
       },
       400
     );
   }
 
-  /*
-   * App proxy authentication request'in gerçekten
-   * Shopify üzerinden geldiğini doğrular.
-   */
   const offlineSession =
     await prisma.session.findFirst({
       where: {
@@ -131,22 +127,38 @@ export const action = async ({
     );
   }
 
-  const {unauthenticated} =
-    await import("../shopify.server");
-
-  const {admin} =
-    await unauthenticated.admin(
-      offlineSession.shop
-    );
+  const {admin} = await unauthenticated.admin(
+    offlineSession.shop
+  );
 
   /*
-   * GERÇEK PUANI SHOPIFY'DAN OKU
+   * SÜRESİ DOLMUŞ REZERVASYONLARI KAPAT
+   */
+  const now = new Date();
+
+  await prisma.rewardTransaction.updateMany({
+    where: {
+      customerId,
+      type: "REDEEM",
+      status: "PENDING",
+      expiresAt: {
+        lt: now,
+      },
+    },
+    data: {
+      status: "EXPIRED",
+    },
+  });
+
+  /*
+   * MÜŞTERİNİN GERÇEK PUAN BAKİYESİNİ OKU
    */
   const customerResponse = await admin.graphql(
     `
       query BelvoraRedeemCustomer($id: ID!) {
         customer(id: $id) {
           id
+
           metafield(
             namespace: "custom"
             key: "belvora_points"
@@ -171,7 +183,6 @@ export const action = async ({
       {
         ok: false,
         error: "CUSTOMER_QUERY_ERROR",
-        details: customerJson.errors,
       },
       500
     );
@@ -192,24 +203,98 @@ export const action = async ({
       0
   );
 
-  if (currentPoints < reward.points) {
+  /*
+   * AKTİF REZERVASYONLARI BUL
+   */
+  const pendingReservations =
+    await prisma.rewardTransaction.findMany({
+      where: {
+        customerId,
+        type: "REDEEM",
+        status: "PENDING",
+        expiresAt: {
+          gt: now,
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+  /*
+   * Aynı ödül zaten oluşturulduysa
+   * yeni kod üretme, mevcut kodu döndür.
+   */
+  const samePending =
+    pendingReservations.find(
+      (item) =>
+        Math.abs(item.points) === reward.points &&
+        item.discountCode
+    );
+
+  if (samePending) {
+    return json({
+      ok: true,
+      reused: true,
+
+      reward: {
+        pointsUsed: reward.points,
+        discountAmount: reward.discount,
+        minimumCart: reward.minimumCart,
+      },
+
+      discount: {
+        code: samePending.discountCode,
+      },
+
+      currentPoints,
+      reservedPoints: reward.points,
+      availablePoints:
+        currentPoints - reward.points,
+    });
+  }
+
+  /*
+   * Aynı anda birden fazla aktif ödül
+   * oluşturulmasını şimdilik engelliyoruz.
+   */
+  if (pendingReservations.length > 0) {
     return json(
       {
         ok: false,
-        error: "NOT_ENOUGH_POINTS",
-        message: "Yeterli Belvora Puanınız yok.",
-        currentPoints,
+        error: "ACTIVE_REWARD_EXISTS",
+        message:
+          "Zaten aktif bir Belvora Club ödülünüz var. Önce mevcut ödülü kullanın.",
       },
       400
     );
   }
 
-  const newPoints =
-    currentPoints - reward.points;
+  const reservedPoints =
+    pendingReservations.reduce(
+      (sum, item) =>
+        sum + Math.abs(item.points),
+      0
+    );
+
+  const availablePoints =
+    currentPoints - reservedPoints;
+
+  if (availablePoints < reward.points) {
+    return json(
+      {
+        ok: false,
+        error: "NOT_ENOUGH_POINTS",
+        message:
+          "Yeterli kullanılabilir Belvora Puanınız yok.",
+        currentPoints,
+        availablePoints,
+      },
+      400
+    );
+  }
 
   const code = createDiscountCode();
-
-  const now = new Date();
 
   const expiresAt = new Date(
     now.getTime() +
@@ -217,149 +302,40 @@ export const action = async ({
   );
 
   /*
-   * SHOPIFY'DA İNDİRİM OLUŞTUR
+   * ÖNCE PENDING REZERVASYON OLUŞTUR
+   * PUAN METAFIELD'DAN HENÜZ DÜŞMEZ.
    */
-  const discountResponse = await admin.graphql(
-    `
-      mutation CreateBelvoraReward(
-        $input: DiscountCodeBasicInput!
-      ) {
-        discountCodeBasicCreate(
-          basicCodeDiscount: $input
-        ) {
-          codeDiscountNode {
-            id
-          }
-
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-    `,
-    {
-      variables: {
-        input: {
-          title:
-            `Belvora Club - ${reward.points} Puan`,
-
-          code,
-
-          startsAt: now.toISOString(),
-
-          endsAt: expiresAt.toISOString(),
-
-          customerSelection: {
-            customers: {
-              add: [customerId],
-            },
-          },
-
-          customerGets: {
-            value: {
-              discountAmount: {
-                amount: reward.discount,
-                appliesOnEachItem: false,
-              },
-            },
-
-            items: {
-              all: true,
-            },
-          },
-
-          minimumRequirement: {
-            subtotal: {
-              greaterThanOrEqualToSubtotal:
-                String(reward.minimumCart),
-            },
-          },
-
-          combinesWith: {
-            orderDiscounts: false,
-            productDiscounts: false,
-            shippingDiscounts: false,
-          },
-
-          usageLimit: 1,
-
-          appliesOncePerCustomer: true,
-        },
-      },
-    }
-  );
-
-  const discountJson =
-    await discountResponse.json();
-
-  if (discountJson.errors?.length) {
-    return json(
-      {
-        ok: false,
-        error: "DISCOUNT_GRAPHQL_ERROR",
-        details: discountJson.errors,
-      },
-      500
-    );
-  }
-
-  const discountErrors =
-    discountJson.data
-      ?.discountCodeBasicCreate
-      ?.userErrors || [];
-
-  if (discountErrors.length) {
-    return json(
-      {
-        ok: false,
-        error: "DISCOUNT_USER_ERROR",
-        details: discountErrors,
-      },
-      400
-    );
-  }
-
-  const discountId =
-    discountJson.data
-      ?.discountCodeBasicCreate
-      ?.codeDiscountNode
-      ?.id;
-
-  /*
-   * LEDGER'A REDEEM YAZ
-   *
-   * orderId boş çünkü henüz checkout siparişe dönüşmedi.
-   * Böylece birden fazla redemption kaydı tutulabilir.
-   */
-  const transaction =
+  const pending =
     await prisma.rewardTransaction.create({
       data: {
         customerId,
         orderId: null,
         type: "REDEEM",
         points: -reward.points,
+        status: "PENDING",
+        discountCode: code,
+        expiresAt,
         description:
-          `${reward.points} puan → ${reward.discount} TL | ${code}`,
+          `${reward.points} puan rezervasyonu → ${reward.discount} TL`,
       },
     });
 
-  /*
-   * BAKİYEYİ DÜŞ
-   */
   try {
-    const pointsResponse =
+    /*
+     * SHOPIFY'DA MÜŞTERİYE ÖZEL
+     * TEK KULLANIMLIK İNDİRİM OLUŞTUR
+     */
+    const discountResponse =
       await admin.graphql(
         `
-          mutation SetBelvoraPoints(
-            $metafields: [MetafieldsSetInput!]!
+          mutation CreateBelvoraReward(
+            $input: DiscountCodeBasicInput!
           ) {
-            metafieldsSet(
-              metafields: $metafields
+            discountCodeBasicCreate(
+              basicCodeDiscount: $input
             ) {
-              metafields {
+              codeDiscountNode {
                 id
-                value
               }
 
               userErrors {
@@ -371,42 +347,89 @@ export const action = async ({
         `,
         {
           variables: {
-            metafields: [
-              {
-                ownerId: customerId,
-                namespace: "custom",
-                key: "belvora_points",
-                type: "number_integer",
-                value: String(newPoints),
+            input: {
+              title:
+                `Belvora Club - ${reward.points} Puan`,
+
+              code,
+
+              startsAt: now.toISOString(),
+
+              endsAt: expiresAt.toISOString(),
+
+              context: {
+                customers: {
+                  add: [customerId],
+                },
               },
-            ],
+
+              customerGets: {
+                value: {
+                  discountAmount: {
+                    amount: String(
+                      reward.discount
+                    ),
+                    appliesOnEachItem: false,
+                  },
+                },
+
+                items: {
+                  all: true,
+                },
+              },
+
+              minimumRequirement: {
+                subtotal: {
+                  greaterThanOrEqualToSubtotal:
+                    String(
+                      reward.minimumCart
+                    ),
+                },
+              },
+
+              combinesWith: {
+                orderDiscounts: false,
+                productDiscounts: false,
+                shippingDiscounts: false,
+              },
+
+              usageLimit: 1,
+
+              appliesOncePerCustomer: true,
+            },
           },
         }
       );
 
-    const pointsJson =
-      await pointsResponse.json();
+    const discountJson =
+      await discountResponse.json();
 
-    const errors = [
-      ...(pointsJson.errors || []),
-      ...(pointsJson.data
-        ?.metafieldsSet
-        ?.userErrors || []),
-    ];
-
-    if (errors.length) {
+    if (discountJson.errors?.length) {
       throw new Error(
-        JSON.stringify(errors)
+        JSON.stringify(
+          discountJson.errors
+        )
       );
     }
+
+    const userErrors =
+      discountJson.data
+        ?.discountCodeBasicCreate
+        ?.userErrors || [];
+
+    if (userErrors.length > 0) {
+      throw new Error(
+        JSON.stringify(userErrors)
+      );
+    }
+
   } catch (error) {
     /*
-     * PUAN YAZIMI BAŞARISIZ OLURSA
-     * LEDGER REDEEM KAYDINI GERİ AL.
+     * İndirim oluşturulamazsa rezervasyonu sil.
      */
     await prisma.rewardTransaction.delete({
       where: {
-        id: transaction.id,
+        id: pending.id,
       },
     });
 
@@ -423,11 +446,17 @@ export const action = async ({
     },
 
     discount: {
-      id: discountId,
       code,
     },
 
-    oldPoints: currentPoints,
-    newPoints,
+    currentPoints,
+
+    reservedPoints: reward.points,
+
+    availablePoints:
+      currentPoints - reward.points,
+
+    expiresAt:
+      expiresAt.toISOString(),
   });
 };
