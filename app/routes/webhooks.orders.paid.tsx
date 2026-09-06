@@ -27,66 +27,50 @@ export const action = async ({
 
   if (!rawCustomerId) {
     console.log(
-      `Sipariş ${rawOrderId}: müşteri hesabı yok, puan yazılmadı.`
+      `Sipariş ${rawOrderId}: müşteri yok, puan işlemi yapılmadı.`
     );
 
     return new Response("OK", {status: 200});
   }
 
-  const orderId = `gid://shopify/Order/${rawOrderId}`;
+  const orderId =
+    `gid://shopify/Order/${rawOrderId}`;
+
   const customerId =
     `gid://shopify/Customer/${rawCustomerId}`;
 
   /*
-   * orders/paid zaten ödeme gerçekleştiğinde gelir.
-   * Havale siparişi sadece oluşturulduğunda bu webhook gelmez.
-   * Shopify'da ödeme "Paid" yapıldığında tetiklenir.
+   * ------------------------------------------------
+   * 1. SİPARİŞTE KULLANILAN İNDİRİM KODLARINI BUL
+   * ------------------------------------------------
    */
 
-  const amount = Number(
-    order.current_total_price ??
-      order.total_price ??
-      0
+  const discountCodes: string[] = Array.isArray(
+    order?.discount_codes
+  )
+    ? order.discount_codes
+        .map((discount: any) =>
+          String(discount?.code || "").trim()
+        )
+        .filter(Boolean)
+    : [];
+
+  const belvoraCode =
+    discountCodes.find((code) =>
+      code.toUpperCase().startsWith("BELVORA-")
+    ) || null;
+
+  console.log(
+    `Sipariş ${order.name || orderId} indirim kodları:`,
+    discountCodes
   );
 
-  if (!Number.isFinite(amount) || amount <= 0) {
-    console.log(
-      `Sipariş ${orderId}: geçerli tutar yok.`
-    );
-
-    return new Response("OK", {status: 200});
-  }
-
-  const pointsToEarn = Math.floor(amount);
-
-  if (pointsToEarn <= 0) {
-    return new Response("OK", {status: 200});
-  }
-
   /*
-   * AYNI SİPARİŞ İKİNCİ KEZ PUAN KAZANDIRMASIN
+   * ------------------------------------------------
+   * 2. MEVCUT PUAN BAKİYESİNİ OKU
+   * ------------------------------------------------
    */
-  const existingTransaction =
-    await prisma.rewardTransaction.findUnique({
-      where: {
-        orderId_type: {
-          orderId,
-          type: "ORDER_EARN",
-        },
-      },
-    });
 
-  if (existingTransaction) {
-    console.log(
-      `Sipariş ${orderId} daha önce puanlandırılmış.`
-    );
-
-    return new Response("OK", {status: 200});
-  }
-
-  /*
-   * MÜŞTERİNİN MEVCUT PUANINI OKU
-   */
   const customerResponse = await admin.graphql(
     `
       query BelvoraCustomerPoints($id: ID!) {
@@ -113,11 +97,6 @@ export const action = async ({
     await customerResponse.json();
 
   if (customerJson.errors?.length) {
-    console.error(
-      "Customer GraphQL error:",
-      customerJson.errors
-    );
-
     throw new Error(
       customerJson.errors
         .map((e: any) => e.message)
@@ -126,125 +105,332 @@ export const action = async ({
   }
 
   const currentPoints = Number(
-    customerJson.data?.customer?.metafield?.value ||
+    customerJson.data?.customer
+      ?.metafield?.value || 0
+  );
+
+  let workingPoints = currentPoints;
+
+  /*
+   * ------------------------------------------------
+   * 3. BELVORA CLUB ÖDÜLÜ KULLANILDIYSA
+   *    PENDING → CONFIRMED
+   * ------------------------------------------------
+   */
+
+  let confirmedReservation:
+    | {
+        id: string;
+        points: number;
+        discountCode: string | null;
+      }
+    | null = null;
+
+  if (belvoraCode) {
+    const pending =
+      await prisma.rewardTransaction.findFirst({
+        where: {
+          customerId,
+          type: "REDEEM",
+          status: "PENDING",
+          discountCode: belvoraCode,
+        },
+      });
+
+    if (pending) {
+      const pointsToRedeem =
+        Math.abs(pending.points);
+
+      /*
+       * Güvenlik:
+       * bakiye rezervasyon tutarından azsa negatife düşme.
+       */
+      workingPoints = Math.max(
+        0,
+        workingPoints - pointsToRedeem
+      );
+
+      confirmedReservation = {
+        id: pending.id,
+        points: pointsToRedeem,
+        discountCode: pending.discountCode,
+      };
+
+      console.log(
+        `🎁 ${belvoraCode}: ${pointsToRedeem} puan ödeme sonrası kullanılacak.`
+      );
+    } else {
+      /*
+       * Kod daha önce CONFIRMED olmuş olabilir.
+       * Duplicate webhook durumunda yeniden düşürmemeliyiz.
+       */
+      const alreadyConfirmed =
+        await prisma.rewardTransaction.findFirst({
+          where: {
+            customerId,
+            type: "REDEEM",
+            status: "CONFIRMED",
+            discountCode: belvoraCode,
+          },
+        });
+
+      if (alreadyConfirmed) {
+        console.log(
+          `Belvora ödülü ${belvoraCode} zaten CONFIRMED.`
+        );
+      } else {
+        console.warn(
+          `Belvora kodu bulundu ancak PENDING rezervasyon bulunamadı: ${belvoraCode}`
+        );
+      }
+    }
+  }
+
+  /*
+   * ------------------------------------------------
+   * 4. BU SİPARİŞ DAHA ÖNCE PUAN KAZANDI MI?
+   * ------------------------------------------------
+   */
+
+  const existingEarn =
+    await prisma.rewardTransaction.findUnique({
+      where: {
+        orderId_type: {
+          orderId,
+          type: "ORDER_EARN",
+        },
+      },
+    });
+
+  /*
+   * İndirim uygulandıktan sonraki ödenen sipariş tutarı.
+   */
+  const amount = Number(
+    order.current_total_price ??
+      order.total_price ??
       0
   );
 
-  const newPoints =
-    currentPoints + pointsToEarn;
+  let pointsToEarn = 0;
 
-  /*
-   * Önce ledger kaydı oluştur.
-   * Unique constraint duplicate webhook'u engeller.
-   */
-  try {
-    await prisma.rewardTransaction.create({
-      data: {
-        customerId,
-        orderId,
-        type: "ORDER_EARN",
-        points: pointsToEarn,
-        description: `Sipariş #${
-          order.name || rawOrderId
-        }`,
-      },
-    });
-  } catch (error: any) {
-    /*
-     * Aynı webhook aynı anda iki kere geldiyse
-     * unique constraint burada engeller.
-     */
-    if (error?.code === "P2002") {
-      console.log(
-        `Sipariş ${orderId} zaten işlendi.`
-      );
+  if (
+    !existingEarn &&
+    Number.isFinite(amount) &&
+    amount > 0
+  ) {
+    pointsToEarn = Math.floor(amount);
 
-      return new Response("OK", {status: 200});
-    }
-
-    throw error;
+    workingPoints += pointsToEarn;
   }
 
   /*
-   * MÜŞTERİ PUANINI GÜNCELLE
+   * ------------------------------------------------
+   * 5. DB İŞLEMLERİNİ HAZIRLA
+   * ------------------------------------------------
    */
+
+  let earnCreated = false;
+  let reservationConfirmed = false;
+
   try {
-    const updateResponse = await admin.graphql(
-      `
-        mutation UpdateBelvoraPoints(
-          $metafields: [MetafieldsSetInput!]!
-        ) {
-          metafieldsSet(
-            metafields: $metafields
-          ) {
-            metafields {
-              id
-              value
-            }
-
-            userErrors {
-              field
-              message
-            }
-          }
-        }
-      `,
-      {
-        variables: {
-          metafields: [
-            {
-              ownerId: customerId,
-              namespace: "custom",
-              key: "belvora_points",
-              type: "number_integer",
-              value: String(newPoints),
-            },
-          ],
+    /*
+     * Önce ödül rezervasyonunu CONFIRMED yap.
+     */
+    if (confirmedReservation) {
+      await prisma.rewardTransaction.update({
+        where: {
+          id: confirmedReservation.id,
         },
+        data: {
+          status: "CONFIRMED",
+          orderId,
+          redeemedAt: new Date(),
+          description:
+            `${confirmedReservation.points} puan kullanıldı | ` +
+            `${confirmedReservation.discountCode} | ` +
+            `${order.name || orderId}`,
+        },
+      });
+
+      reservationConfirmed = true;
+    }
+
+    /*
+     * Sonra sipariş kazanç ledger kaydını oluştur.
+     */
+    if (!existingEarn && pointsToEarn > 0) {
+      try {
+        await prisma.rewardTransaction.create({
+          data: {
+            customerId,
+            orderId,
+            type: "ORDER_EARN",
+            status: "CONFIRMED",
+            points: pointsToEarn,
+            description:
+              `Sipariş ${order.name || rawOrderId}`,
+          },
+        });
+
+        earnCreated = true;
+      } catch (error: any) {
+        /*
+         * Aynı anda duplicate webhook geldiyse
+         * unique constraint bizi korur.
+         */
+        if (error?.code !== "P2002") {
+          throw error;
+        }
+
+        console.log(
+          `Sipariş ${orderId} ORDER_EARN zaten oluşturulmuş.`
+        );
+
+        /*
+         * Biz yukarıda puanı workingPoints'e eklemiştik.
+         * Duplicate ise eklemeyi geri al.
+         */
+        workingPoints -= pointsToEarn;
+        pointsToEarn = 0;
       }
-    );
-
-    const updateJson =
-      await updateResponse.json();
-
-    if (updateJson.errors?.length) {
-      throw new Error(
-        updateJson.errors
-          .map((e: any) => e.message)
-          .join(", ")
-      );
     }
 
-    const userErrors =
-      updateJson.data?.metafieldsSet
-        ?.userErrors || [];
+    /*
+     * ------------------------------------------------
+     * 6. SHOPIFY MÜŞTERİ BAKİYESİNİ TEK SEFERDE YAZ
+     * ------------------------------------------------
+     */
 
-    if (userErrors.length > 0) {
-      throw new Error(
-        userErrors
-          .map((e: any) => e.message)
-          .join(", ")
-      );
+    if (
+      reservationConfirmed ||
+      earnCreated
+    ) {
+      const updateResponse =
+        await admin.graphql(
+          `
+            mutation UpdateBelvoraPoints(
+              $metafields: [MetafieldsSetInput!]!
+            ) {
+              metafieldsSet(
+                metafields: $metafields
+              ) {
+                metafields {
+                  id
+                  value
+                }
+
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `,
+          {
+            variables: {
+              metafields: [
+                {
+                  ownerId: customerId,
+                  namespace: "custom",
+                  key: "belvora_points",
+                  type: "number_integer",
+                  value: String(
+                    Math.max(
+                      0,
+                      Math.floor(workingPoints)
+                    )
+                  ),
+                },
+              ],
+            },
+          }
+        );
+
+      const updateJson =
+        await updateResponse.json();
+
+      if (updateJson.errors?.length) {
+        throw new Error(
+          updateJson.errors
+            .map((e: any) => e.message)
+            .join(", ")
+        );
+      }
+
+      const userErrors =
+        updateJson.data
+          ?.metafieldsSet
+          ?.userErrors || [];
+
+      if (userErrors.length > 0) {
+        throw new Error(
+          userErrors
+            .map((e: any) => e.message)
+            .join(", ")
+        );
+      }
     }
+
   } catch (error) {
     /*
-     * Shopify'a puan yazılamadıysa ledger kaydını
-     * geri siliyoruz ki webhook tekrar geldiğinde
-     * yeniden deneyebilsin.
+     * Shopify bakiyesi yazılamazsa
+     * DB değişikliklerini mümkün olduğunca geri al.
      */
-    await prisma.rewardTransaction.deleteMany({
-      where: {
-        orderId,
-        type: "ORDER_EARN",
-      },
-    });
+
+    if (earnCreated) {
+      await prisma.rewardTransaction.deleteMany({
+        where: {
+          orderId,
+          type: "ORDER_EARN",
+        },
+      });
+    }
+
+    if (
+      reservationConfirmed &&
+      confirmedReservation
+    ) {
+      await prisma.rewardTransaction.update({
+        where: {
+          id: confirmedReservation.id,
+        },
+        data: {
+          status: "PENDING",
+          orderId: null,
+          redeemedAt: null,
+        },
+      });
+    }
 
     throw error;
   }
 
+  /*
+   * ------------------------------------------------
+   * 7. LOG
+   * ------------------------------------------------
+   */
+
   console.log(
-    `✅ ${order.name || orderId}: +${pointsToEarn} puan. Yeni bakiye: ${newPoints}`
+    [
+      `✅ ${order.name || orderId}`,
+      belvoraCode
+        ? `Belvora kodu: ${belvoraCode}`
+        : "Belvora ödülü yok",
+      confirmedReservation
+        ? `-${confirmedReservation.points} puan kullanıldı`
+        : "0 puan kullanıldı",
+      pointsToEarn > 0
+        ? `+${pointsToEarn} yeni puan`
+        : "Yeni puan zaten işlenmiş / yok",
+      `Yeni bakiye: ${Math.max(
+        0,
+        Math.floor(workingPoints)
+      )}`,
+    ].join(" | ")
   );
 
-  return new Response("OK", {status: 200});
+  return new Response("OK", {
+    status: 200,
+  });
 };
