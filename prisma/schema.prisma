@@ -36,6 +36,7 @@ model RewardTransaction {
   id           String   @id @default(cuid())
   customerId   String
   orderId      String?
+  referenceId  String?
   type         String
   points       Int
   description  String?
@@ -48,6 +49,7 @@ model RewardTransaction {
   createdAt    DateTime @default(now())
 
   @@unique([orderId, type])
+  @@unique([referenceId, type])
   @@index([customerId])
   @@index([discountCode])
   @@index([status])
