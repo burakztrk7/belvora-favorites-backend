@@ -33,15 +33,13 @@ export const action = async ({
   /*
    * Aynı refund ikinci kez işlenmesin.
    */
-  const existingRefund =
-    await prisma.rewardTransaction.findUnique({
-      where: {
-        referenceId_type: {
-          referenceId: refundId,
-          type: "ORDER_REFUND",
-        },
-      },
-    });
+ const existingRefund =
+  await prisma.rewardTransaction.findFirst({
+    where: {
+      referenceId: refundId,
+      type: "ORDER_REFUND",
+    },
+  });
 
   if (existingRefund) {
     console.log(

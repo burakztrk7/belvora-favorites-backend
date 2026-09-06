@@ -49,7 +49,7 @@ model RewardTransaction {
   createdAt    DateTime @default(now())
 
   @@unique([orderId, type])
-  @@unique([referenceId, type])
+  @@index([referenceId])
   @@index([customerId])
   @@index([discountCode])
   @@index([status])
