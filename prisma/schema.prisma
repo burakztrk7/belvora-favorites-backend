@@ -33,14 +33,22 @@ model Session {
   refreshTokenExpires DateTime?
 }
 model RewardTransaction {
-  id          String   @id @default(cuid())
-  customerId  String
-  orderId     String?
-  type        String
-  points      Int
-  description String?
-  createdAt   DateTime @default(now())
+  id           String   @id @default(cuid())
+  customerId   String
+  orderId      String?
+  type         String
+  points       Int
+  description  String?
+
+  status       String   @default("CONFIRMED")
+  discountCode String?
+  expiresAt    DateTime?
+  redeemedAt   DateTime?
+
+  createdAt    DateTime @default(now())
 
   @@unique([orderId, type])
   @@index([customerId])
+  @@index([discountCode])
+  @@index([status])
 }
