@@ -1,29 +1,29 @@
-import { json, type LoaderFunctionArgs } from "@remix-run/node";
-import { prisma } from "../db.server";
+import type { LoaderFunctionArgs } from "react-router";
+import prisma from "../db.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const url = new URL(request.url);
   const secret = url.searchParams.get("secret");
 
   if (!process.env.BACKFILL_SECRET || secret !== process.env.BACKFILL_SECRET) {
-    return json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    return Response.json(
+      { ok: false, error: "Unauthorized" },
+      { status: 401 },
+    );
   }
 
   try {
-    const sessions = await prisma.session.findMany({
+    const offlineSession = await prisma.session.findFirst({
       where: {
         isOnline: false,
       },
       orderBy: {
         id: "desc",
       },
-      take: 1,
     });
 
-    const offlineSession = sessions[0];
-
     if (!offlineSession) {
-      return json(
+      return Response.json(
         { ok: false, error: "Offline Shopify session bulunamadı." },
         { status: 500 },
       );
@@ -33,7 +33,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     const accessToken = offlineSession.accessToken;
 
     if (!accessToken) {
-      return json(
+      return Response.json(
         { ok: false, error: "Shopify access token bulunamadı." },
         { status: 500 },
       );
@@ -111,7 +111,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
       if (!response.ok || result.errors) {
         console.error("Shopify GraphQL error:", result);
 
-        return json(
+        return Response.json(
           {
             ok: false,
             error: "Shopify GraphQL isteği başarısız.",
@@ -125,10 +125,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
       for (const edge of edges) {
         const customer = edge.node;
-        const metafield = customer.metafield;
-
         const favoriteProducts =
-          metafield?.references?.nodes?.filter(Boolean) ?? [];
+          customer.metafield?.references?.nodes?.filter(Boolean) ?? [];
 
         if (favoriteProducts.length === 0) {
           continue;
@@ -144,12 +142,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
             "İsimsiz müşteri",
           email: customer.email ?? null,
           numberOfOrders: customer.numberOfOrders ?? 0,
-          amountSpent: customer.amountSpent
-            ? {
-                amount: customer.amountSpent.amount,
-                currencyCode: customer.amountSpent.currencyCode,
-              }
-            : null,
+          amountSpent: customer.amountSpent ?? null,
           favoriteCount: favoriteProducts.length,
           favorites: favoriteProducts.map((product: any) => ({
             productId: product.id,
@@ -164,10 +157,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
         });
       }
 
-      hasNextPage = result.data?.customers?.pageInfo?.hasNextPage ?? false;
+      hasNextPage =
+        result.data?.customers?.pageInfo?.hasNextPage ?? false;
 
       cursor =
-        edges.length > 0 ? edges[edges.length - 1].cursor : null;
+        edges.length > 0
+          ? edges[edges.length - 1].cursor
+          : null;
 
       if (!cursor) {
         hasNextPage = false;
@@ -190,10 +186,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
     for (const customer of customersWithFavorites) {
       for (const product of customer.favorites) {
-        const current = productStats.get(product.productId);
+        const existing = productStats.get(product.productId);
 
-        if (current) {
-          current.count += 1;
+        if (existing) {
+          existing.count += 1;
         } else {
           productStats.set(product.productId, {
             productId: product.productId,
@@ -205,11 +201,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
       }
     }
 
-    const mostFavoritedProducts = Array.from(productStats.values()).sort(
-      (a, b) => b.count - a.count,
-    );
+    const mostFavoritedProducts = Array.from(
+      productStats.values(),
+    ).sort((a, b) => b.count - a.count);
 
-    return json({
+    return Response.json({
       ok: true,
       summary: {
         customersWithFavorites: customersWithFavorites.length,
@@ -225,7 +221,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   } catch (error) {
     console.error("Favorites report error:", error);
 
-    return json(
+    return Response.json(
       {
         ok: false,
         error:
